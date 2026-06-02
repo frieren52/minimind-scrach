@@ -1,4 +1,6 @@
 import math
+import torch
+import torch.nn as nn
 from transformers import PretrainedConfig
 
 class MiniMindConfig(PretrainedConfig):
@@ -37,3 +39,16 @@ class MiniMindConfig(PretrainedConfig):
         self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
+
+class RMSNorm(nn.Module):
+
+    def __init__(self, dim:int, eps:float=1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x:torch.Tensor):
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        x = x * rms
+        return x * self.weight
