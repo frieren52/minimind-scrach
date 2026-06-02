@@ -40,6 +40,8 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
+
+
 class RMSNorm(nn.Module):
 
     def __init__(self, dim:int, eps:float=1e-5):
@@ -52,3 +54,35 @@ class RMSNorm(nn.Module):
         rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         x = x * rms
         return x * self.weight
+    
+
+def precompute_freqs_cis(dim:int, end:int=int(32 * 1024), rope_base:float=1e6, rope_scaling:dict=None):
+    freqs = 1.0 / rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+    atten_factor = 1.0
+
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow, atten_factor = (
+            rope_scaling.get( "original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16), # factor = 目标长 / 原生长
+            rope_scaling.get("beta_fast", 32),
+            rope_scaling.get("beta_slow", 1), # 波长 / 原长上下限
+            rope_scaling.get("attention_factor", 1.0)
+        )
+        if end / orig_max > 1: # 当实际预计算长度 > 原训练长度才启用 YaRN 
+            inv_dim= lambda b: (dim * math.log(orig_max / (2 * math.pi * b))) / (2 * math.log(rope_base))
+            low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1) # 计算对应index
+            gamma = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+            freqs = freqs * (1 - gamma + gamma / factor)
+    
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * atten_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * atten_factor
+    return freqs_cos, freqs_sin
+
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    def rotate_half(x): # 对半切片、前后互换 + 前半取负
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), dim=-1)
+    q_embed = ((q * cos.unsqueeze(unsqueeze_dim))) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim)).to(q.type)
+    k_embed = ((k * cos.unsqueeze(unsqueeze_dim))) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim)).to(k.dtype)
+    return q_embed, k_embed
